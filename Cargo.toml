@@ -1,0 +1,13 @@
+[package]
+name = "strm_plugin"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "LocalReel storage plugin for .strm files"
+repository = "https://github.com/LocalReel/localreel-plugin-strm"
+publish = false
+
+[dependencies]
+serde_json = "1"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+httpdate = "1"
