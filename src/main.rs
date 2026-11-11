@@ -8,7 +8,35 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+/// Sockets served at once. Beyond this the accept loop drops the connection so
+/// an overloaded plugin stays responsive instead of queueing work it cannot do.
+const MAX_CONCURRENT: usize = 16;
+
+/// Reserve one request slot, or report that the plugin is at capacity.
+///
+/// Written as a compare-exchange loop rather than `fetch_update`: that helper
+/// became deprecated (renamed `try_update`), while the loop compiles on every
+/// supported toolchain and is just as clear for a single bounded counter.
+fn acquire_slot(active: &AtomicUsize) -> bool {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_CONCURRENT {
+            return false;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
 
 use serde_json::{json, Value};
 
@@ -52,28 +80,21 @@ fn main() {
 
     let context = std::sync::Arc::new(context);
     let token = std::sync::Arc::new(token);
-    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active = std::sync::Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming().flatten() {
         // Never queue unbounded threads/sockets. Dropping an overloaded socket
         // lets the host retry instead of blocking the accept loop.
-        if active
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |n| (n < 16).then_some(n + 1),
-            )
-            .is_err()
-        {
+        if !acquire_slot(&active) {
             continue;
         }
         let context = context.clone();
         let token = token.clone();
         let active = active.clone();
         std::thread::spawn(move || {
-            struct Permit(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+            struct Permit(std::sync::Arc<AtomicUsize>);
             impl Drop for Permit {
                 fn drop(&mut self) {
-                    self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                    self.0.fetch_sub(1, Ordering::Release);
                 }
             }
             let _permit = Permit(active);
